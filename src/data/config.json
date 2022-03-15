@@ -1,0 +1,17 @@
+{
+  "joinInfo": {},
+
+  "answerVariation": {
+    "minimum": 5,
+    "maximum": 20,
+    "deviation": 10
+  },
+  "joinVariation": {
+    "minimum": 1,
+    "maximum": 4,
+    "deviation": 3
+  },
+  "waitForSuccessfulJoin": false,
+
+  "names": [{ "type": "randomEntry", "file": "./src/data/names.csv" }]
+}
