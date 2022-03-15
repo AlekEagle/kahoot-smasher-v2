@@ -1,187 +1,154 @@
-import worker from 'node:worker_threads';
-import Logger, { Level } from './utils/Logger';
-import readline from 'node:readline/promises';
 import Chalk from 'chalk';
-import FS from 'fs/promises';
 import configJSON from './data/config.json';
+import CLI, { Level } from './utils/CLI';
+import Kahoot, { Client } from '../../kahoot.js';
+import createNameGenerator from './utils/NameGenerator';
+import { Choices } from './utils/KahootData';
+import { config } from 'process';
 
-function randomString(length: number = 10): string {
-  if (length < 1) throw new Error('Length must be greater than 0.');
-  const chars =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_. ';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
-
-type NamePart =
-  | string
-  | { type: 'text'; content: string }
-  | { type: 'randomString'; length: number }
-  | { type: 'randomEntry'; file: string }
-  | { type: 'id'; isZeroIndexed: boolean };
-
-type NameGenerator = (id: number) => string;
-
-async function createNameGenerator(
-  nameConfig: NamePart[]
-): Promise<NameGenerator> {
-  const funnyFiles = new Map();
-
-  const generators: NameGenerator[] = await Promise.all(
-    nameConfig.map<Promise<NameGenerator>>(async part => {
-      if (typeof part == 'string') return () => part;
-
-      switch (part.type) {
-        case 'text':
-          return () => part.content;
-        case 'randomString':
-          return () => randomString(part.length);
-        case 'randomEntry':
-          let stuff: string[];
-          if (!funnyFiles.has(part.file)) {
-            stuff = (await FS.readFile(part.file)).toString().split(',');
-            funnyFiles.set(part.file, stuff);
-          } else stuff = funnyFiles.get(part.file);
-
-          return () => {
-            const index = Math.floor(Math.random() * stuff.length);
-            return stuff[index];
-          };
-        case 'id':
-          return id => `${id + (part.isZeroIndexed ? 0 : 1)}`;
-      }
-    })
-  );
-
-  let badWordWarn = false;
-  return id => {
-    const name = generators.map(generator => generator(id)).join('');
-    if (/sex|fuck|shit/i.test(name) && !badWordWarn) {
-      console.warn(
-        "A player's name contains a bad word. They might be given a different name by Kahoot."
-      );
-      badWordWarn = true;
-    }
-    return name;
-  };
-}
-
-const players: Map<number, worker.Worker> = new Map();
-let tryingToClose = false;
-
-global.console = new Logger(
-  process.env.DEBUG ? Level.DEBUG : Level.INFO
-) as any;
-
-process.on('uncaughtException', exception => {
-  console.error(exception);
-  process.exit(1);
-});
-
-function randomWait() {
-  let end = configJSON.joinVariation.minimum * 1000;
-  end +=
-    Math.random() * (2 * (configJSON.joinVariation.deviation * 1000)) -
-    configJSON.joinVariation.deviation * 1000;
-  return configJSON.joinVariation.minimum * 1000 > end
-    ? configJSON.joinVariation.minimum * 1000
-    : Math.min(configJSON.joinVariation.maximum * 1000, end);
-}
+const cli = new CLI(Level.DEBUG);
 
 if (!process.stdin.isTTY)
   throw new Error('Must be ran from an interactive terminal.');
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: '> '
+const players: Map<number, Client> = new Map();
+let tryingToClose = false,
+  quizIsInProgress = false,
+  answerOverride: number | number[] | string | undefined;
+
+process.on('uncaughtException', exception => {
+  cli.error(exception);
+  process.exit(1);
 });
+
+function randomJoin() {
+  const deviationRange =
+    configJSON.joinVariation.maximum - configJSON.joinVariation.minimum;
+  const deviation = Math.random() * deviationRange - deviationRange / 2;
+  return (configJSON.joinVariation.minimum + deviation) * 1000;
+}
+
+function randomAnswer() {
+  const deviationRange =
+    configJSON.answerVariation.maximum - configJSON.answerVariation.minimum;
+  const deviation = Math.random() * deviationRange - deviationRange / 2;
+  return (configJSON.answerVariation.minimum + deviation) * 1000;
+}
 
 (async function () {
   let gameID =
     (configJSON as any)?.joinInfo?.pin ||
-    (await rl.question(
-      `${Chalk.bold.green('Enter the game PIN: ')}${Chalk.reset()}`
-    ));
-  let playerCountStr =
-    (configJSON as any)?.joinInfo?.players?.toString() ||
-    (await rl.question(
-      `${Chalk.bold.green('Enter the number of players: ')}${Chalk.reset()}`
-    ));
+    (await cli.prompt(Chalk.bold.green("What's the game Pin?")));
 
-  if (!playerCountStr.match(/^\d+$/)) throw new Error('Invalid player count.');
+  let playerCountStr =
+    (configJSON as any)?.joinInfo?.players ||
+    parseInt(await cli.prompt(Chalk.bold.green('How many players?')));
+
+  if (isNaN(playerCountStr)) throw new Error('Invalid player count.');
   let playerCount = parseInt(playerCountStr);
 
-  console.log('Creating players and connecting to game...');
+  cli.log(`Joining game ${gameID} with ${playerCount} player(s)...`);
+
+  cli.log('Creating players and connecting to game...');
   let i = 0;
 
   const nameGenerator = await createNameGenerator(configJSON.names as any);
 
   function initPlayer(i: number) {
     const is = i;
-    let player = new worker.Worker('./dist/Player.js', {
-      workerData: {
-        gameID,
-        index: is,
-        name: nameGenerator(is)
-      }
+    let player = Kahoot();
+    player.once('Joined', () => {
+      cli.log(
+        `${Chalk.bold.green(`Player ${is + 1} joined.`)}${Chalk.reset()}`
+      );
     });
-    function playerMessageHandler(message: any) {
-      switch (message.type) {
-        case 'Joined':
-          console.log(
-            `${Chalk.bold.green(`Player ${is + 1} joined.`)}${Chalk.reset()}`
-          );
-          if (configJSON.waitForSuccessfulJoin)
-            if (++i < playerCount && !tryingToClose)
-              setTimeout(() => initPlayer(i), randomWait());
-          break;
-        case 'QuizStart':
-          console.log(
-            `${Chalk.bold.green(
-              `Player ${is + 1} started the quiz.`
-            )}${Chalk.reset()}`
-          );
-          break;
-        case 'error':
-          console.error(
-            `${Chalk.bold.red(
-              `Player ${is + 1} encountered an error: ${message.message}`
-            )}${Chalk.reset()}`
-          );
-          break;
-      }
+    if (i === 0) {
+      player.on('QuizStart', () => {
+        if (quizIsInProgress) return;
+        quizIsInProgress = true;
+        cli.log(Chalk.bold.green('Quiz started.'));
+      });
+
+      player.on('QuizEnd', () => {
+        if (!quizIsInProgress) return;
+        quizIsInProgress = false;
+        cli.log(Chalk.bold.green('Quiz ended.'));
+      });
+
+      player.on('QuestionStart', q => {
+        cli.log(
+          Chalk.bold.green(
+            `Question started.\nQuestion #${
+              q.questionIndex + 1
+            }\nQuestion Time: ${
+              q.timeAvailable / 1000
+            } Seconds\nAnswer type for this question: ${
+              q.gameBlockType
+            }\nPossible Answers: ${new Array(
+              q.quizQuestionAnswers[q.questionIndex]
+            )
+              .fill(1)
+              .map((_, a) => Choices[a])
+              .join(', ')}`
+          )
+        );
+      });
+
+      player.on('QuestionEnd', () => {
+        cli.log(Chalk.bold.green('Question ended.'));
+        answerOverride = undefined;
+      });
     }
-    player.on('message', playerMessageHandler);
-    player.on('exit', () => {
+
+    player.on('Disconnect', () => {
       players.delete(is);
     });
-    player.on('error', () => {
-      players.delete(is);
+    player.on('QuestionStart', async s => {
+      setTimeout(async () => {
+        let answer =
+          answerOverride ||
+          Math.floor(Math.random() * (s as any).numberOfChoices);
+        await player.answer(answer);
+        cli.log(
+          `${Chalk.bold.green(
+            `Player ${is + 1} answered with ${Choices[answer as number]}.`
+          )}`
+        );
+      }, randomAnswer());
+    });
+    player.join(gameID, nameGenerator(i)).then(() => {
+      if (configJSON.waitForSuccessfulJoin)
+        if (++i < playerCount && !tryingToClose)
+          setTimeout(() => initPlayer(i), randomJoin());
     });
     players.set(is, player);
     if (!configJSON.waitForSuccessfulJoin)
       if (++i < playerCount && !tryingToClose)
-        setTimeout(() => initPlayer(i), randomWait());
+        setTimeout(() => initPlayer(i), randomJoin());
   }
   initPlayer(i);
 })();
 
-rl.on('SIGINT', () => {
+process.on('SIGINT', exitHandler);
+process.on('SIGTERM', exitHandler);
+cli.on('exiting', exitHandler);
+
+function exitHandler() {
   if (tryingToClose) {
-    console.warn('Forcefully closing...');
+    cli.warn('Forcefully closing...');
     process.exit(1);
   }
   tryingToClose = true;
-  console.log('Disconnecting players...');
-  players.forEach(player => player.postMessage({ type: 'Quit' }));
+  cli.log('Disconnecting players...');
+  players.forEach(player => player.leave());
   setInterval(() => {
-    if (players.size === 0) process.exit(0);
-    console.log('Waiting for players to close...');
-    console.log('if this takes too long, press Ctrl+C again.');
-    console.log(`${players.size} player(s) remaining.`);
+    if (players.size === 0) {
+      cli.close();
+      process.exit(0);
+    }
+    cli.log('Waiting for players to close...');
+    cli.log('if this takes too long, press Ctrl+C again.');
+    players.forEach(player => player.leave());
+    cli.log(`${players.size} player(s) remaining.`);
   }, 5000);
-});
+}
